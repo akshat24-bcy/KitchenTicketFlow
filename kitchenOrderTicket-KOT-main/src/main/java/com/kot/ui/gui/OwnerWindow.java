@@ -1,0 +1,255 @@
+package com.kot.ui.gui;
+
+import com.kot.core.SessionManager;
+import com.kot.core.SharedQueue;
+import com.kot.event.OrderUpdateListener;
+import com.kot.model.Chef;
+import com.kot.model.Order;
+import com.kot.model.Waiter;
+
+import com.kot.db.UserDAO;
+import com.kot.model.User;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.List;
+
+public class OwnerWindow extends JFrame implements OrderUpdateListener {
+    private final SharedQueue sharedQueue;
+    private final User ownerUser;
+    private final UserDAO userDAO;
+    
+    // UI
+    private DefaultListModel<String> queueListModel;
+    private DefaultListModel<String> alertsListModel;
+    
+    // Manage Staff UI
+    private DefaultListModel<String> staffListModel;
+    private JList<String> staffList;
+    
+    // Performance Tab UI
+    private JTextArea performanceArea;
+
+    // Data
+    private int totalOrdersCompleted = 0;
+    private int totalOrdersRejected = 0;
+    private double totalRevenue = 0.0;
+
+    public OwnerWindow(SharedQueue sharedQueue, User ownerUser) {
+        this.sharedQueue = sharedQueue;
+        this.ownerUser = ownerUser;
+        this.userDAO = new UserDAO();
+        sharedQueue.addOrderUpdateListener(this);
+        
+        SessionManager.getInstance().registerSession(ownerUser.getUserId());
+        
+        setTitle("Owner Dashboard - " + ownerUser.getName() + " (Live Tracking)");
+        setSize(750, 550);
+        setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE); // Changing to dispose to allow proper logout
+        setLocationRelativeTo(null);
+        
+        initUI();
+        
+        // Timer to auto-refresh live pending queue and staff list every 2 seconds
+        Timer refreshTimer = new Timer(2000, e -> {
+            refreshPendingQueue();
+            refreshStaffList();
+        });
+        refreshTimer.start();
+    }
+
+    private void initUI() {
+        JTabbedPane tabbedPane = new JTabbedPane();
+        tabbedPane.addTab("Live Kitchen Tracking", createLivePanel());
+        tabbedPane.addTab("Overall Performance", createPerformancePanel());
+        tabbedPane.addTab("Manage Staff", createManageStaffPanel());
+        tabbedPane.addTab("Create Accounts", createAccountPanel());
+        add(tabbedPane);
+    }
+    
+    private JPanel createAccountPanel() {
+        JPanel panel = new JPanel(new GridLayout(6, 1, 10, 10));
+        panel.setBorder(BorderFactory.createEmptyBorder(20, 50, 20, 50));
+        
+        panel.add(new JLabel("Staff Full Name:"));
+        JTextField nameField = new JTextField();
+        panel.add(nameField);
+        
+        panel.add(new JLabel("Staff Role:"));
+        JComboBox<String> roleCombo = new JComboBox<>(new String[]{"Waiter", "Chef"});
+        panel.add(roleCombo);
+        
+        JButton createBtn = new JButton("Generate Temporary Credentials");
+        panel.add(new JLabel()); // Spacer
+        panel.add(createBtn);
+        
+        createBtn.addActionListener(e -> {
+            String name = nameField.getText();
+            String role = (String) roleCombo.getSelectedItem();
+            
+            if (name.trim().isEmpty()) {
+                JOptionPane.showMessageDialog(this, "Name cannot be empty.");
+                return;
+            }
+            
+            String[] credentials = userDAO.createUser(name.trim(), role);
+            if (credentials != null) {
+                String msg = "Account created successfully!\n\n" +
+                             "Username: " + credentials[0] + "\n" +
+                             "One-Time Password: " + credentials[1] + "\n\n" +
+                             "Please provide these to the new employee. They will be forced to change the password upon first login.";
+                JOptionPane.showMessageDialog(this, msg, "Temporary Credentials", JOptionPane.INFORMATION_MESSAGE);
+                nameField.setText("");
+            } else {
+                JOptionPane.showMessageDialog(this, "Failed to create account.", "Database Error", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+        
+        return panel;
+    }
+    
+    private JPanel createLivePanel() {
+        JPanel panel = new JPanel(new GridLayout(1, 2, 10, 10));
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        
+        // Pending Queue
+        queueListModel = new DefaultListModel<>();
+        JList<String> queueList = new JList<>(queueListModel);
+        JScrollPane queueScroll = new JScrollPane(queueList);
+        queueScroll.setBorder(BorderFactory.createTitledBorder("Pending Kitchen Queue"));
+        panel.add(queueScroll);
+        
+        // Alerts
+        alertsListModel = new DefaultListModel<>();
+        JList<String> alertsList = new JList<>(alertsListModel);
+        alertsList.setForeground(Color.RED);
+        JScrollPane alertsScroll = new JScrollPane(alertsList);
+        alertsScroll.setBorder(BorderFactory.createTitledBorder("Cancelled / Rejected Alerts"));
+        panel.add(alertsScroll);
+        
+        return panel;
+    }
+    
+    private JPanel createPerformancePanel() {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+        
+        performanceArea = new JTextArea("Initializing performance stats...");
+        performanceArea.setEditable(false);
+        performanceArea.setFont(new Font("Monospaced", Font.PLAIN, 14));
+        panel.add(new JScrollPane(performanceArea), BorderLayout.CENTER);
+        
+        updatePerformanceArea();
+        
+        JButton logoutBtn = new JButton("Logout & Close");
+        logoutBtn.setBackground(new Color(255, 100, 100));
+        logoutBtn.setForeground(Color.WHITE);
+        logoutBtn.addActionListener(e -> dispose());
+        panel.add(logoutBtn, BorderLayout.SOUTH);
+        
+        return panel;
+    }
+    
+    private JPanel createManageStaffPanel() {
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        panel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+        
+        staffListModel = new DefaultListModel<>();
+        staffList = new JList<>(staffListModel);
+        panel.add(new JScrollPane(staffList), BorderLayout.CENTER);
+        
+        JButton removeBtn = new JButton("Remove Selected Staff");
+        removeBtn.addActionListener(e -> removeSelectedStaff());
+        panel.add(removeBtn, BorderLayout.SOUTH);
+        
+        return panel;
+    }
+    
+    private void refreshPendingQueue() {
+        List<Order> snapshot = sharedQueue.getPendingOrdersSnapshot();
+        SwingUtilities.invokeLater(() -> {
+            queueListModel.clear();
+            for (Order o : snapshot) {
+                queueListModel.addElement("Order #" + o.getOrderId() + " | Table " + o.getTableNumber() + " | By: " + o.getWaiterName());
+            }
+        });
+    }
+    
+    private void refreshStaffList() {
+        SessionManager sm = SessionManager.getInstance();
+        List<Waiter> waiters = sm.getActiveWaitersList();
+        List<Chef> chefs = sm.getActiveChefsList();
+        
+        SwingUtilities.invokeLater(() -> {
+            staffListModel.clear();
+            for (Waiter w : waiters) {
+                staffListModel.addElement("Waiter ID: " + w.getEmployeeId() + " | Name: " + w.getName());
+            }
+            for (Chef c : chefs) {
+                staffListModel.addElement("Chef ID: " + c.getEmployeeId() + " | Name: " + c.getName());
+            }
+        });
+    }
+    
+    private void removeSelectedStaff() {
+        String selection = staffList.getSelectedValue();
+        if (selection == null) return;
+        
+        int id = Integer.parseInt(selection.split("\\|")[0].replaceAll("[^0-9]", ""));
+        
+        if (selection.startsWith("Waiter")) {
+            WaiterWindow w = SessionManager.getInstance().getWaiterWindow(id);
+            if (w != null) {
+                w.disposeWindow(); // Force close Waiter's GUI remotely
+                JOptionPane.showMessageDialog(this, "Waiter " + id + " has been logged out and removed.", "Success", JOptionPane.INFORMATION_MESSAGE);
+            }
+        } else if (selection.startsWith("Chef")) {
+            ChefWindow c = SessionManager.getInstance().getChefWindow(id);
+            if (c != null) {
+                if (c.getCurrentOrder() != null) {
+                     JOptionPane.showMessageDialog(this, "Cannot remove: Chef is currently processing an order! Wait until they finish.", "Action Blocked", JOptionPane.WARNING_MESSAGE);
+                     return;
+                }
+                c.disposeWindow(); // Force close Chef's GUI remotely
+                JOptionPane.showMessageDialog(this, "Chef " + id + " has been logged out and removed.", "Success", JOptionPane.INFORMATION_MESSAGE);
+            }
+        }
+        
+        refreshStaffList();
+    }
+    
+    private void updatePerformanceArea() {
+        SwingUtilities.invokeLater(() -> {
+            String text = "====================================\n" +
+                          "     KOT RESTAURANT PERFORMANCE      \n" +
+                          "====================================\n\n" +
+                          "Total Orders Successfully Completed: " + totalOrdersCompleted + "\n" +
+                          "Total Orders Rejected: " + totalOrdersRejected + "\n" +
+                          "Total Revenue: ₹" + String.format("%.2f", totalRevenue) + "\n\n" +
+                          "Note: Entries are read-only and immutable for audit purposes.\n";
+            performanceArea.setText(text);
+        });
+    }
+
+    @Override
+    public void onOrderCompleted(Order order) {
+        totalOrdersCompleted++;
+        totalRevenue += order.getTotalAmount();
+        updatePerformanceArea();
+    }
+
+    @Override
+    public void onOrderCancelled(Order order) {
+        totalOrdersRejected++;
+        updatePerformanceArea();
+        SwingUtilities.invokeLater(() -> {
+            alertsListModel.addElement("ALERT: Order #" + order.getOrderId() + " rejected by " + order.getChefName() + " (Reason: " + order.getRejectionReason() + ")");
+        });
+    }
+
+    @Override
+    public void dispose() {
+        SessionManager.getInstance().unregisterSession(ownerUser.getUserId());
+        super.dispose();
+    }
+}
